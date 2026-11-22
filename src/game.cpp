@@ -784,8 +784,9 @@ void GameReader::update(int width, int height, const Features& features) {
 }
 
 float GameReader::aimRadiusPixels(int width, const Features& features) const {
-    if (!camera_.valid || width <= 0) return 0.f;
-    const double focal = width * .5 / std::tan(rad(camera_.fov) * .5);
+    if (!camera_.valid || width <= 0 || !std::isfinite(features.aimFov)) return 0.f;
+    constexpr double referenceCameraFov = 90.0;
+    const double focal = width * .5 / std::tan(rad(referenceCameraFov) * .5);
     return float(focal * std::tan(rad(features.aimFov) * .5));
 }
 
@@ -802,18 +803,37 @@ void GameReader::aim(const Features& features, HWND targetWindow, bool menuOpen)
     const POINT origin{rc.right / 2, rc.bottom / 2};
     const float acquireRadius = aimRadiusPixels(rc.right, features);
     Target* selected = nullptr;
-    float closest = acquireRadius;
-    // Keep the same actor while the key remains held; the circle only controls acquisition.
-    for (auto& t : targets_) {
-        if (t.dead || t.distance > features.aimDistance || !t.aimValid[features.aimBone]) continue;
-        const auto point = t.aimScreen[features.aimBone];
-        if (point.x < 0 || point.y < 0 || point.x >= rc.right || point.y >= rc.bottom) continue;
-        if (t.actor == lockedActor_) { selected = &t; break; }
-        const float dx = float(point.x - origin.x), dy = float(point.y - origin.y);
-        const float distance = std::sqrt(dx * dx + dy * dy);
-        if (distance < closest) { closest = distance; selected = &t; }
+    if (lockedActor_) {
+        const auto locked = std::find_if(targets_.begin(), targets_.end(),
+            [this](const Target& target) { return target.actor == lockedActor_; });
+        if (locked != targets_.end()) {
+            if (locked->dead) releaseLock();
+            else selected = &*locked;
+        } else if (!validObject(lockedActor_) || !isEnemy(lockedActor_)) {
+            releaseLock();
+        } else {
+            Target lockState{};
+            lockState.actor = lockedActor_;
+            readHealth(lockState);
+            if (lockState.dead) releaseLock();
+            else return;
+        }
     }
-    if (!selected) { releaseLock(); return; }
+    if (!lockedActor_) {
+        float closest = acquireRadius;
+        for (auto& t : targets_) {
+            if (t.dead || t.distance > features.aimDistance || !t.aimValid[features.aimBone]) continue;
+            const auto point = t.aimScreen[features.aimBone];
+            if (point.x < 0 || point.y < 0 || point.x >= rc.right || point.y >= rc.bottom) continue;
+            const float dx = float(point.x - origin.x), dy = float(point.y - origin.y);
+            const float distance = std::sqrt(dx * dx + dy * dy);
+            if (distance < closest) { closest = distance; selected = &t; }
+        }
+    }
+    if (!selected) return;
+    if (!selected->aimValid[features.aimBone]) return;
+    const auto aimPoint = selected->aimScreen[features.aimBone];
+    if (aimPoint.x < 0 || aimPoint.y < 0 || aimPoint.x >= rc.right || aimPoint.y >= rc.bottom) return;
     const bool acquired = lockedActor_ != selected->actor;
     lockedActor_ = selected->actor;
     // One correction per observed game camera update; never accumulate against stale feedback.
