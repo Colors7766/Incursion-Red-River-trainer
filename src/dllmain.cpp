@@ -71,6 +71,9 @@ static void saveConfig(const Features& f) {
     file << "espHealthBar=" << int(f.espHealthBar) << '\n';
     file << "espHealthNumber=" << int(f.espHealthNumber) << '\n';
     file << "espCorpse=" << int(f.espCorpse) << '\n';
+    file << "espSafeBoxes=" << int(f.espSafeBoxes) << '\n';
+    for (int i = 0; i < 4; ++i) file << "safeBoxColor" << i << '=' << f.safeBoxColor[i] << '\n';
+    file << "safeBoxDistance=" << f.safeBoxDistance << '\n';
     file << "corpseDistance=" << f.corpseDistance << '\n';
     file << "infiniteHealth=" << int(f.infiniteHealth) << '\n';
     file << "infiniteBodyStamina=" << int(f.infiniteBodyStamina) << '\n';
@@ -188,6 +191,7 @@ static void loadConfig(Features& f) {
     boolean("aimbot", f.aimbot); boolean("showAimFov", f.showAimFov);
     boolean("espDistanceLabel", f.espDistanceLabel); boolean("espHealthBar", f.espHealthBar);
     boolean("espHealthNumber", f.espHealthNumber); boolean("espCorpse", f.espCorpse);
+    boolean("espSafeBoxes", f.espSafeBoxes);
     boolean("infiniteHealth", f.infiniteHealth); boolean("infiniteBodyStamina", f.infiniteBodyStamina);
     boolean("infiniteArmStamina", f.infiniteArmStamina); boolean("preventBleeding", f.preventBleeding);
     boolean("preventFracture", f.preventFracture); boolean("keepInventoryOnDeath", f.keepInventoryOnDeath);
@@ -219,11 +223,13 @@ static void loadConfig(Features& f) {
     for (int i = 0; i < 4; ++i) {
         real("skeletonColor" + std::to_string(i), f.skeletonColor[i]);
         real("boxColor" + std::to_string(i), f.boxColor[i]);
+        real("safeBoxColor" + std::to_string(i), f.safeBoxColor[i]);
     }
     f.espDistance = std::clamp(f.espDistance, 1.f, 1000.f);
     f.aimDistance = std::clamp(f.aimDistance, 1.f, 1000.f);
     f.aimFov = std::clamp(f.aimFov, 1.f, 30.f);
     f.corpseDistance = std::clamp(f.corpseDistance, 1.f, 1000.f);
+    f.safeBoxDistance = std::clamp(f.safeBoxDistance, 1.f, 2000.f);
     f.playerSpeedMultiplier = std::clamp(f.playerSpeedMultiplier, 0.5f, 5.f);
     f.playerJumpHeightMultiplier = std::clamp(f.playerJumpHeightMultiplier, 0.5f, 5.f);
     f.meleeAttackSpeedMultiplier = std::clamp(f.meleeAttackSpeedMultiplier, 0.5f, 5.f);
@@ -413,7 +419,7 @@ static bool initD3D() {
     if (FAILED(hr)) return initFailure(failedStage ? failedStage : "DirectComposition", hr);
     return true;
 }
-struct DrawCounts { int boxes{}, skeletonSegments{}, headRings{}, healthBars{}, healthNumbers{}, distanceLabels{}, corpseLabels{}; };
+struct DrawCounts { int boxes{}, skeletonSegments{}, headRings{}, healthBars{}, healthNumbers{}, distanceLabels{}, corpseLabels{}, safeBoxes{}; };
 
 static int drawBoneSegment(ImDrawList* draw, ImVec2 from, ImVec2 to,
                            ImVec2 head, float headRadius, ImU32 color, float lineWidth) {
@@ -453,9 +459,31 @@ static DrawCounts drawEsp(ImDrawList* draw, int w, int h) {
         draw->AddCircle(ImVec2(w * .5f, h * .5f), radius, IM_COL32(255, 220, 80, 180), 96, 1.25f);
     }
     if (!features.espBox && !features.espSkeleton && !features.espHealthBar &&
-        !features.espHealthNumber && !features.espDistanceLabel && !features.espCorpse) return counts;
+        !features.espHealthNumber && !features.espDistanceLabel && !features.espCorpse &&
+        !features.espSafeBoxes) return counts;
     if (!reader.camera().valid || w <= 0 || h <= 0) return counts;
     const float focal = w * .5f / std::tan(reader.camera().fov * 3.14159265358979323846f / 360.f);
+    if (features.espSafeBoxes) {
+        auto* font = ImGui::GetFont();
+        for (const auto& safe : reader.safeBoxes()) {
+            if (!safe.visible || safe.distance > features.safeBoxDistance) continue;
+            const float pixelsPerMeter = focal / (std::max)(safe.distance, 0.5f);
+            const float scale = std::clamp(pixelsPerMeter / 50.f, .35f, 2.f);
+            const float size = std::clamp(16.f * scale, 14.f, 24.f);
+            char label[64]{};
+            std::snprintf(label, sizeof(label), "%s保险箱 %.0f m", safe.large ? "大" : "小", safe.distance);
+            const ImVec2 textSize = font->CalcTextSizeA(size, 1e6f, 0.f, label);
+            const ImVec2 position(float(safe.screen.x) - textSize.x * .5f,
+                float(safe.screen.y) - textSize.y * .5f);
+            draw->AddText(font, size, ImVec2(position.x + scale, position.y + scale),
+                IM_COL32(0, 0, 0, 220), label);
+            const ImU32 safeColor = ImGui::ColorConvertFloat4ToU32(ImVec4(
+                features.safeBoxColor[0], features.safeBoxColor[1],
+                features.safeBoxColor[2], features.safeBoxColor[3]));
+            draw->AddText(font, size, position, safeColor, label);
+            ++counts.safeBoxes;
+        }
+    }
     for (const auto& t : reader.targets()) {
         const float pixelsPerMeter = focal / (std::max)(t.distance, 0.5f);
         const float scale = std::clamp(pixelsPerMeter / 50.f, .35f, 2.f);
@@ -575,6 +603,10 @@ static void render() {
                 sliderConfig("透视距离", features.espDistance, 1.f, 1000.f, "%.0f m");
                 checkboxConfig("尸体显示", features.espCorpse);
                 sliderConfig("尸体显示距离", features.corpseDistance, 1.f, 1000.f, "%.0f m");
+                ImGui::Separator();
+                checkboxConfig("保险箱透视", features.espSafeBoxes);
+                colorConfig("保险箱颜色", features.safeBoxColor);
+                sliderConfig("保险箱显示距离", features.safeBoxDistance, 1.f, 2000.f, "%.0f m");
                 ImGui::Text("目标数量：%d", static_cast<int>(reader.targets().size()));
                 ImGui::EndTabItem();
             }
@@ -699,10 +731,10 @@ static void render() {
         (!reportedCorpse && drawCounts.corpseLabels))) {
         char line[384]{};
         const int length = std::snprintf(line, sizeof(line),
-            "pid=%lu size=%dx%d boxes=%d skeletonSegments=%d headRings=%d healthBars=%d healthNumbers=%d distanceLabels=%d corpseLabels=%d indices=%d present=0x%08lX\r\n",
+            "pid=%lu size=%dx%d boxes=%d skeletonSegments=%d headRings=%d healthBars=%d healthNumbers=%d distanceLabels=%d corpseLabels=%d safeBoxes=%d indices=%d present=0x%08lX\r\n",
             static_cast<unsigned long>(GetCurrentProcessId()), w, h, drawCounts.boxes,
             drawCounts.skeletonSegments, drawCounts.headRings, drawCounts.healthBars,
-            drawCounts.healthNumbers, drawCounts.distanceLabels, drawCounts.corpseLabels,
+            drawCounts.healthNumbers, drawCounts.distanceLabels, drawCounts.corpseLabels, drawCounts.safeBoxes,
             drawData->TotalIdxCount, static_cast<unsigned long>(presentResult));
         if (length > 0) appendOverlayLog(line, static_cast<DWORD>(length));
         reportedDraw |= hasLivingDraw;

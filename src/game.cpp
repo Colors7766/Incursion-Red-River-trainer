@@ -70,6 +70,8 @@ GameReader::~GameReader() {
 void GameReader::shutdown() {
     lockedActor_ = 0;
     localPawn_ = 0;
+    safeWorld_ = 0;
+    openedSafeBoxes_.clear();
     restorePlayerSettings();
     while (!poseRefreshOverrides_.empty()) restorePoseRefresh(poseRefreshOverrides_.begin()->first);
 }
@@ -607,6 +609,7 @@ void GameReader::update(int width, int height, const Features& features) {
         report(text);
     };
     targets_.clear();
+    safeBoxes_.clear();
     camera_.valid = false;
     controller_ = 0;
     localAbilityComponent_ = 0;
@@ -614,6 +617,10 @@ void GameReader::update(int width, int height, const Features& features) {
     if (!worldGlobal_) { noPlayer("world_global=missing"); return; }
     auto world = value<uintptr_t>(worldGlobal_);
     if (!validObject(world)) { worldGlobal_ = 0; noPlayer("world=invalid"); return; }
+    if (safeWorld_ != world) {
+        safeWorld_ = world;
+        openedSafeBoxes_.clear();
+    }
     auto gameInstance = value<uintptr_t>(world + o_.owningGameInstance);
     if (!validObject(gameInstance)) { noPlayer("game_instance=invalid"); return; }
     struct TArray { uintptr_t data; int32_t count; int32_t max; };
@@ -663,6 +670,50 @@ void GameReader::update(int width, int height, const Features& features) {
         return;
     }
     if (!camera_.valid) { report("camera=invalid"); return; }
+    if (features.espSafeBoxes) {
+        for (int32_t i = 0; i < actors.count; ++i) {
+            const auto actor = value<uintptr_t>(actors.data + uintptr_t(i) * sizeof(uintptr_t));
+            if (!validObject(actor)) continue;
+            const auto type = className(actor);
+            const bool large = type == "BP_LootContainer_Safe_02_C";
+            const bool small = type == "BP_LootContainer_Safe_01_C";
+            if (!large && !small) continue;
+            const auto interaction = value<uintptr_t>(actor + 0x2B8);
+            if (!validObject(interaction) || value<uint8_t>(interaction + 0x139) == 0) continue;
+            // Option 0 requires the key; option 1 is the no-key interaction used
+            // after the safe has been unlocked. Cache that transition because
+            // ActiveInteractionOption is only populated while the target updates.
+            TArray options{};
+            const auto active = value<uintptr_t>(interaction + 0x188);
+            if (read(interaction + 0x160, &options, sizeof(options)) &&
+                options.count > 1 && options.count <= 16 && options.max >= options.count &&
+                valid(options.data) && validObject(active)) {
+                for (int32_t optionIndex = 0; optionIndex < options.count; ++optionIndex) {
+                    if (value<uintptr_t>(options.data + uintptr_t(optionIndex) * sizeof(uintptr_t)) == active) {
+                        if (optionIndex == 1) openedSafeBoxes_.insert(actor);
+                        break;
+                    }
+                }
+            }
+            if (openedSafeBoxes_.contains(actor)) continue;
+            const auto root = value<uintptr_t>(actor + o_.actorRoot);
+            if (!validObject(root) || value<uintptr_t>(root + 0x20) != actor) continue;
+            BoneTransform transform{};
+            if (!read(root + o_.componentToWorld, &transform, sizeof(transform)) ||
+                !finiteTransform(transform)) continue;
+            const auto dx = transform.translation.x - camera_.location.x;
+            const auto dy = transform.translation.y - camera_.location.y;
+            const auto dz = transform.translation.z - camera_.location.z;
+            const float distance = float(std::sqrt(dx * dx + dy * dy + dz * dz) / 100.0);
+            if (distance > features.safeBoxDistance) continue;
+            SafeBoxTarget safe{};
+            safe.location = transform.translation;
+            safe.distance = distance;
+            safe.large = large;
+            safe.visible = project(safe.location, safe.screen, width, height);
+            if (safe.visible) safeBoxes_.push_back(safe);
+        }
+    }
     int enemies = 0, skeletons = 0, boxes = 0, lines = 0;
     std::vector<uintptr_t> activeMeshes;
     float nearest = 100000.f;

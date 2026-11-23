@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 struct Vec3 { double x{}, y{}, z{}; };
 struct Rotator { double pitch{}, yaw{}, roll{}; };
@@ -38,6 +39,14 @@ struct Target {
     bool visible{};
 };
 
+struct SafeBoxTarget {
+    Vec3 location{};
+    POINT screen{};
+    float distance{};
+    bool large{};
+    bool visible{};
+};
+
 struct Features {
     bool espBox{true};
     bool espSkeleton{true};
@@ -55,6 +64,9 @@ struct Features {
     bool espHealthBar{true};
     bool espHealthNumber{true};
     bool espCorpse{true};
+    bool espSafeBoxes{false};
+    float safeBoxColor[4]{1.f, 210.f / 255.f, 70.f / 255.f, 240.f / 255.f};
+    float safeBoxDistance{300.f};
     float corpseDistance{200.f};
     bool infiniteHealth{};
     bool infiniteBodyStamina{};
@@ -95,6 +107,7 @@ public:
     void update(int width, int height, const Features& features);
     const CameraState& camera() const { return camera_; }
     const std::vector<Target>& targets() const { return targets_; }
+    const std::vector<SafeBoxTarget>& safeBoxes() const { return safeBoxes_; }
     const char* status() const { return status_; }
     uintptr_t localAbilityComponent() const { return localAbilityComponent_; }
     uintptr_t moduleBase() const { return module_; }
@@ -104,6 +117,7 @@ public:
 private:
     uintptr_t module_{}, moduleSize_{};
     uintptr_t worldGlobal_{};
+    uintptr_t safeWorld_{};
     uintptr_t namePool_{};
     uintptr_t controller_{};
     uintptr_t localPawn_{};
@@ -111,6 +125,8 @@ private:
     float cameraTimestamp_{}, lastAimTimestamp_{-1.f};
     CameraState camera_{};
     std::vector<Target> targets_;
+    std::vector<SafeBoxTarget> safeBoxes_;
+    std::unordered_set<uintptr_t> openedSafeBoxes_;
     char status_[96]{"等待 UE5 数据"};
     struct Offsets {
         uint32_t persistentLevel = 0x30;
