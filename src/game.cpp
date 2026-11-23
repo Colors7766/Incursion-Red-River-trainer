@@ -81,7 +81,7 @@ bool GameReader::teleportToMarker() {
     if (!validObject(level)) return false;
     struct ActorArray { uintptr_t data; int32_t count, max; } actors{};
     if (!read(level + o_.levelActors, &actors, sizeof(actors)) || actors.count <= 0 ||
-        actors.count > 8192 || actors.max < actors.count || !valid(actors.data)) return false;
+        actors.count > 65536 || actors.max < actors.count || !valid(actors.data)) return false;
 
     Vec3 destination{};
     bool found = false;
@@ -656,7 +656,7 @@ void GameReader::update(int width, int height, const Features& features) {
     if (!validObject(level)) { report("persistent_level=invalid"); return; }
     TArray actors{};
     if (!read(level + o_.levelActors, &actors, sizeof(actors))) { report("actor_array=unreadable"); return; }
-    if (actors.count <= 0 || actors.count > 8192 || actors.max < actors.count || !valid(actors.data)) {
+    if (actors.count <= 0 || actors.count > 65536 || actors.max < actors.count || !valid(actors.data)) {
         char state[96]{};
         std::snprintf(state, sizeof(state), "actor_array=invalid count=%d max=%d", actors.count, actors.max);
         report(state);

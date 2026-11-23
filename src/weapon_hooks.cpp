@@ -101,6 +101,7 @@ GetterArg originalMultiplier{};
 Stack originalStack{};
 BulletDamage originalBulletDamage{};
 PointDamage originalPointDamage{};
+ProcessEvent originalProcessEvent{};
 std::atomic_uint inFlight{};
 struct CallGuard { CallGuard(){++inFlight;} ~CallGuard(){--inFlight;} };
 struct SavedAmmo { Object inventory; bool original{}; };
@@ -228,6 +229,20 @@ public:
                 if (objectName(fn)==key && isA(fn,"Function")) return cache.emplace(key,fn).first->second;
         }
         return cache.emplace(key,0).first->second;
+    }
+    uintptr_t processEventTarget() const {
+        const auto chunks=get<uintptr_t>(module+objectsRva);
+        const auto count=get<int32_t>(module+objectsRva+20);
+        if (!chunks || count<=0 || count>4000000) return 0;
+        for (int32_t i=0;i<count;++i) {
+            const auto chunk=get<uintptr_t>(chunks+uintptr_t(i/65536)*8);
+            const auto address=get<uintptr_t>(chunk+uintptr_t(i%65536)*24);
+            if (!object(address).address) continue;
+            const auto vtable=get<uintptr_t>(address);
+            const auto entry=get<uintptr_t>(vtable+0x260);
+            if (entry>=module && entry<module+imageSize) return entry;
+        }
+        return 0;
     }
     static bool dispatch(uintptr_t entry,uintptr_t target,uintptr_t fn,void* parameters) {
         __try {
@@ -970,6 +985,33 @@ public:
     }
 } runtime;
 
+void __fastcall processEventImplementation(void* target,void* function,void* parameters) {
+    CallGuard guard;
+    if (runtime.enabled.load() && runtime.infiniteGrenades.load() && function && parameters) {
+        const auto functionName=runtime.objectName(reinterpret_cast<uintptr_t>(function));
+        const auto data=reinterpret_cast<uintptr_t>(parameters);
+        bool consumed=false;
+        if (functionName=="RequestConsumeItem" || functionName=="TryConsumeItem" ||
+            functionName=="RequestDropItem") {
+            const auto owner=get<uintptr_t>(data);
+            const auto item=data+8;
+            consumed=owner==runtime.localInventory.load() && runtime.isGrenade(item);
+            if (consumed) put(data+0xf0,int32_t(0));
+        } else if (functionName=="UpdateItemStack") {
+            const auto owner=runtime.localInventory.load();
+            consumed=owner && owner==reinterpret_cast<uintptr_t>(target) && runtime.isGrenade(data);
+            if (consumed) put(data+0xe8,get<int32_t>(data+0xd8));
+        } else if (functionName=="RemoveItem") {
+            const auto owner=runtime.localInventory.load();
+            consumed=owner && owner==reinterpret_cast<uintptr_t>(target) && runtime.isGrenade(data);
+            if (consumed) { put(data+0xea,uint8_t(1)); return; }
+        }
+        if (consumed) {
+            char line[160]{};std::snprintf(line,sizeof(line),"grenade non-consume ProcessEvent=%s\r\n",functionName.c_str());log(line);
+        }
+    }
+    originalProcessEvent(target,function,parameters);
+}
 void __fastcall tickImplementation(void* component,float delta,uint32_t tickType,void* tickFunction) {
     CallGuard guard;
     runtime.tick(reinterpret_cast<uintptr_t>(component),false);
@@ -1040,6 +1082,12 @@ bool WeaponHooks::initialize(uintptr_t module) {
     }
     runtime.module=module;if (runtime.name(0)!="None") return false;
     const auto result=MH_Initialize();if (result!=MH_OK && result!=MH_ERROR_ALREADY_INITIALIZED) return false;
+    const auto processEvent=runtime.processEventTarget();
+    if (!processEvent || MH_CreateHook(reinterpret_cast<void*>(processEvent),&processEventImplementation,
+        reinterpret_cast<void**>(&originalProcessEvent))!=MH_OK) {
+        runtime.setStatus("ProcessEvent 接口校验失败");return false;
+    }
+    runtime.hooks.push_back(reinterpret_cast<void*>(processEvent));
     constexpr unsigned char tick[]{0x48,0x89,0x5c,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57};
     constexpr unsigned char normal[]{0x48,0x89,0x5c,0x24,0x08,0x57};
     constexpr unsigned char multiplier[]{0x48,0x89,0x74,0x24,0x10,0x57};
