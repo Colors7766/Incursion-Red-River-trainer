@@ -47,7 +47,7 @@ cmake --build "$buildDirectory" --config Release
 | `src/loader.cpp` | 独立加载器的入口，不负责菜单或功能实现。 |
 | `CMakeLists.txt` | 定义两个构建目标、参与编译的文件和需要链接的库。 |
 | `build.ps1` | 一键构建脚本；初始化编译环境并调用 CMake，手动构建时可不用。 |
-| `third_party/imgui/` | Dear ImGui 菜单组件及 Win32、DirectX 11 渲染后端。 |
+| `third_party/imgui/` | ImGui 菜单组件及 Win32、DirectX 11 渲染后端。 |
 | `third_party/minhook/` | 当前 x64 构建所用的函数钩子库。 |
 
 第三方许可证：[ImGui](third_party/imgui/LICENSE.txt)、[MinHook](third_party/minhook/LICENSE.txt)。
