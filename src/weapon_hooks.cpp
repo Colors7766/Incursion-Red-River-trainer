@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -20,6 +21,29 @@ constexpr uintptr_t bulletDamageRva=0x643c1e0, pointDamageRva=0x643c2e0;
 constexpr uintptr_t objectsRva=0xc134f60, worldRva=0xc2c6b98, namesRva=0xc050e00;
 constexpr DWORD timestamp=0x41e01d02, imageSize=0xcf84000;
 constexpr UINT cleanupMessage=WM_APP+0x517;
+
+struct ResourceDefinition {
+    const wchar_t* tag;
+    const char* label;
+};
+constexpr auto resources=std::to_array<ResourceDefinition>({
+    {L"Resource.Metal", "金属"},
+    {L"Resource.Oil", "石油"},
+    {L"Resource.Concrete", "混凝土"},
+    {L"Resource.Food", "食物"},
+});
+static_assert(resources.size()==static_cast<size_t>(HideoutResource::Count));
+
+struct FactionDefinition {
+    const char* tag;
+    const char* label;
+};
+constexpr auto factions = std::to_array<FactionDefinition>({
+    {"Mission.Faction.BLUEFOR", "UICS"},
+    {"Mission.Faction.GREYFOR", "VLF"},
+    {"Mission.Faction.OPFOR", "IGC"},
+});
+static_assert(factions.size() == static_cast<size_t>(Faction::Count));
 
 void log(const char* text) {
     wchar_t path[MAX_PATH]{};
@@ -43,6 +67,11 @@ template<class T> bool put(uintptr_t address,const T& value) {
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 struct Array { uintptr_t data{}; int32_t count{},capacity{}; };
+struct LoyaltyEntry {
+    uint32_t factionNameIndex, factionNameNumber;
+    float points;
+};
+static_assert(sizeof(LoyaltyEntry) == 0x0c && offsetof(LoyaltyEntry, points) == 8);
 struct Guid { uint64_t a{},b{}; bool operator==(const Guid&) const=default; };
 struct GuidHash { size_t operator()(const Guid& id) const { return size_t(id.a^(id.b*0x9e3779b97f4a7c15ULL)); } };
 struct Object {
@@ -84,6 +113,8 @@ public:
     std::atomic_bool noRecoil{},noSpread{},infiniteGrenades{},oneHit{};
     std::atomic_bool addMoneyRequested{},addCoinsRequested{},addExperienceRequested{},freeUpgradeRequested{};
     std::atomic_int addMoneyAmount{},addCoinsAmount{},addExperienceAmount{};
+    std::array<std::atomic_int, resources.size()> addResourceAmounts{};
+    std::array<std::atomic<float>, factions.size()> addReputationPoints{};
     std::atomic<float> requestedGameSpeed{1.f};
     std::atomic_int requestedHour{-1},currentWorldMinute{-1};
     std::atomic_bool worldTimeRefreshRequested{};
@@ -104,6 +135,7 @@ public:
     ULONGLONG nextWorldUpdate{};
     float originalSearchTime{},appliedSearchTime{};
     uintptr_t inventoryLibrary{},aiLibrary{},missionLibrary{},stringLibrary{},gameplayStatics{},searchSettingsDefault{};
+    uintptr_t resourceLibrary{};
     std::unordered_map<uint32_t,std::string> names;
     std::unordered_map<uintptr_t,std::unordered_map<std::string,Field>> fieldCache;
     std::unordered_map<uintptr_t,std::unordered_map<std::string,uintptr_t>> functionCache;
@@ -221,7 +253,7 @@ public:
         return invoke(target,key,&result,8) ? object(result).address : 0;
     }
     void findLibraries() {
-        if (inventoryLibrary && aiLibrary && missionLibrary && stringLibrary && gameplayStatics) return;
+        if (inventoryLibrary && aiLibrary && missionLibrary && stringLibrary && gameplayStatics && resourceLibrary) return;
         const auto chunks=get<uintptr_t>(module+objectsRva);
         const auto count=get<int32_t>(module+objectsRva+20);
         if (!chunks || count<=0 || count>4000000) return;
@@ -243,13 +275,14 @@ public:
                 continue;
             }
             if (key!="InventoryFunctionLibrary" && key!="AIFunctionLibrary" &&
-                key!="IRRMissionSystemFunctionLibrary") continue;
+                key!="IRRMissionSystemFunctionLibrary" && key!="IRRResourceFunctionLibrary") continue;
             const auto cdo=get<uintptr_t>(address+0x110);
             if (!object(cdo).address) continue;
             if (key=="InventoryFunctionLibrary") inventoryLibrary=cdo;
             else if (key=="AIFunctionLibrary") aiLibrary=cdo;
-            else missionLibrary=cdo;
-            if (inventoryLibrary && aiLibrary && missionLibrary && stringLibrary && gameplayStatics) break;
+            else if (key=="IRRMissionSystemFunctionLibrary") missionLibrary=cdo;
+            else resourceLibrary=cdo;
+            if (inventoryLibrary && aiLibrary && missionLibrary && stringLibrary && gameplayStatics && resourceLibrary) break;
         }
     }
     bool globalSpeed(const Object& target,const char* operation,float& value) {
@@ -366,6 +399,133 @@ public:
             currencyName,uint32_t(nameParams.result),count,reinterpret_cast<void*>(playerInventory),
             reinterpret_cast<void*>(stashInventory),reinterpret_cast<void*>(gameInstance));log(line);
     }
+    void addResource(const ResourceDefinition& resource, int32_t amount) {
+        if (!alive(world)) {
+            setActionStatus("当前据点未就绪");
+            return;
+        }
+        const auto netDriver = field(cls(world.address), "NetDriver");
+        if (!netDriver || netDriver.size != sizeof(uintptr_t) || get<uintptr_t>(world.address + netDriver.offset)) {
+            setActionStatus("添加资源仅支持单人游戏");
+            return;
+        }
+        const auto component = contextResult(resourceLibrary, "GetResourceComponent", world.address);
+        if (!isA(component, "IRRResourceComponent") || !object(stringLibrary).address) {
+            setActionStatus("据点资源接口未就绪");
+            return;
+        }
+
+        const auto length = static_cast<int32_t>(std::wcslen(resource.tag) + 1);
+        struct NameParams { uintptr_t data; int32_t count, capacity; uint64_t result; };
+        NameParams tag{reinterpret_cast<uintptr_t>(resource.tag), length, length, 0};
+        if (!invoke(stringLibrary, "Conv_StringToName", &tag, sizeof(tag)) || !uint32_t(tag.result)) {
+            setActionStatus("无法识别据点资源");
+            return;
+        }
+
+        // FGameplayTag wraps one FName. Both getters place the int32 result at offset 8.
+        struct AmountParams { uint64_t tag; int32_t value; };
+        constexpr size_t amountParamsSize = 0x0c;
+        AmountParams before{tag.result, -1}, capacity{tag.result, -1};
+        if (!invoke(component, "GetAmount", &before, amountParamsSize) || before.value < 0 ||
+            !invoke(component, "GetMaxAmount", &capacity, amountParamsSize)) {
+            setActionStatus("读取据点资源余额失败");
+            return;
+        }
+        const int32_t limit = capacity.value > 0 ? capacity.value : INT32_MAX;
+        if (before.value >= limit) {
+            setActionStatus("该据点资源已达容量上限");
+            return;
+        }
+
+        struct AddParams { uint64_t tag; int32_t delta; uint8_t clampToCapacity; };
+        // The reflected parameter size ends at the bool, before the compiler's tail padding.
+        constexpr auto addParamsSize = offsetof(AddParams, clampToCapacity) + sizeof(uint8_t);
+        static_assert(addParamsSize == 0x0d);
+        AddParams request{tag.result, std::min(amount, limit - before.value), 1};
+        AmountParams after{tag.result, -1};
+        if (!invoke(component, "AddAmount", &request, addParamsSize) ||
+            !invoke(component, "GetAmount", &after, amountParamsSize) || after.value <= before.value) {
+            setActionStatus("未确认据点资源增加");
+            return;
+        }
+
+        const auto autoSave = field(cls(component), "bAutoSaveOnChange");
+        if (!autoSave || autoSave.size != 1 || !get<uint8_t>(component + autoSave.offset)) {
+            uint8_t saved{};
+            if (!invoke(component, "SaveToSlot", &saved, sizeof(saved)) || !saved) {
+                setActionStatus("资源已增加，保存失败");
+                return;
+            }
+        }
+        char message[128]{};
+        std::snprintf(message, sizeof(message), "已添加%s %d，当前余额 %d",
+            resource.label, after.value - before.value, after.value);
+        setActionStatus(message);
+    }
+    bool readFactionLoyalty(uintptr_t mission, const char* factionTag, LoyaltyEntry& result) {
+        const auto progress = field(cls(mission), "ProgressData");
+        const auto loyalty = field(progress.type, "LoyaltyData");
+        if (!progress || !loyalty || loyalty.size != sizeof(Array) ||
+            get<uint32_t>(arrayType(loyalty) + 0x58) != sizeof(LoyaltyEntry)) return false;
+
+        const auto entries = array(mission + progress.offset + loyalty.offset, 64);
+        for (int32_t i = 0; i < entries.count; ++i) {
+            const auto entry = get<LoyaltyEntry>(entries.data + i * sizeof(LoyaltyEntry));
+            if (entry.factionNameNumber == 0 && name(entry.factionNameIndex) == factionTag &&
+                std::isfinite(entry.points)) {
+                result = entry;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void addReputation(const FactionDefinition& faction, float points) {
+        if (!alive(world) || !alive(pawn)) {
+            setActionStatus("任务进度组件未就绪");
+            return;
+        }
+        const auto netDriver = field(cls(world.address), "NetDriver");
+        if (!netDriver || netDriver.size != sizeof(uintptr_t) || get<uintptr_t>(world.address + netDriver.offset)) {
+            setActionStatus("添加阵营声望仅支持单人游戏");
+            return;
+        }
+
+        const auto mission = contextResult(missionLibrary, "GetIRRMissionComponent", pawn.address);
+        LoyaltyEntry before{};
+        if (!isA(mission, "IRRMissionComponent") || !readFactionLoyalty(mission, faction.tag, before)) {
+            setActionStatus("无法读取该阵营的声望");
+            return;
+        }
+        if (before.points >= 100.f) {
+            char message[96]{};
+            std::snprintf(message, sizeof(message), "%s 声望已达上限 100", faction.label);
+            setActionStatus(message);
+            return;
+        }
+
+        LoyaltyEntry delta{before.factionNameIndex, before.factionNameNumber, points};
+        struct AddLoyaltyParams {
+            Array changes;
+            uint8_t saveAfter;
+        };
+        constexpr size_t parameterSize = offsetof(AddLoyaltyParams, saveAfter) + sizeof(uint8_t);
+        static_assert(parameterSize == 0x11);
+        AddLoyaltyParams request{{reinterpret_cast<uintptr_t>(&delta), 1, 1}, 1};
+        LoyaltyEntry after{};
+        if (!invoke(mission, "AddFactionLoyalty", &request, parameterSize) ||
+            !readFactionLoyalty(mission, faction.tag, after) || after.points <= before.points) {
+            setActionStatus("未确认阵营声望增加");
+            return;
+        }
+
+        char message[128]{};
+        std::snprintf(message, sizeof(message), "%s 声望已增加 %.2f，当前 %.2f / 100",
+            faction.label, after.points - before.points, after.points);
+        setActionStatus(message);
+    }
+
     void addExperience(int32_t amount) {
         if (!missionLibrary || !alive(pawn)) {setActionStatus("经验接口未就绪");log("XP request failed: interface or pawn unavailable\r\n");return;}
         const auto mission=contextResult(missionLibrary,"GetIRRMissionComponent",pawn.address);
@@ -419,6 +579,14 @@ public:
         if (addCoinsRequested.exchange(false))
             addCurrency(L"MarkedCoin",addCoinsAmount.load(),"标记硬币");
         if (missionLibrary && addExperienceRequested.exchange(false)) addExperience(addExperienceAmount.load());
+        for (size_t i = 0; i < resources.size(); ++i) {
+            const int32_t amount = addResourceAmounts[i].exchange(0);
+            if (amount > 0) addResource(resources[i], amount);
+        }
+        for (size_t i = 0; i < factions.size(); ++i) {
+            const float points = addReputationPoints[i].exchange(0.f);
+            if (points > 0.f) addReputation(factions[i], points);
+        }
         if (missionLibrary && freeUpgradeRequested.exchange(false)) freeUpgrade();
     }
     template<class Callback> void eachItem(uintptr_t component,Callback callback) {
@@ -732,7 +900,7 @@ public:
         noRecoil=active.recoil;noSpread=active.spread;infiniteGrenades=active.grenades;
         oneHit=active.oneHit;localController=controller;
         const auto now=GetTickCount64();
-        if (!inventoryLibrary || !aiLibrary || !missionLibrary || !stringLibrary || !gameplayStatics) findLibraries();
+        findLibraries();
         updateWorldFeatures(instance,now);
         auto currentInventory=contextResult(inventoryLibrary,"GetPlayerInventoryComponent",pawn.address);
         if (!currentInventory) currentInventory=referenced(pawn.address,"BP_InventoryComponent");
@@ -919,6 +1087,18 @@ void WeaponHooks::requestAddCoins(int amount) {
 void WeaponHooks::requestAddExperience(int amount) {
     runtime.addExperienceAmount=std::clamp(amount,1,100000000);runtime.addExperienceRequested=true;
     runtime.setActionStatus("经验请求已排队");log("UI queued add-XP request\r\n");
+}
+void WeaponHooks::requestAddResource(HideoutResource resource, int amount) {
+    const auto index = static_cast<size_t>(resource);
+    if (index >= resources.size()) return;
+    runtime.setActionStatus("资源添加请求已排队");
+    runtime.addResourceAmounts[index] = std::clamp(amount, 1, 100000000);
+}
+void WeaponHooks::requestAddReputation(Faction faction, float points) {
+    const auto index = static_cast<size_t>(faction);
+    if (index >= factions.size() || !std::isfinite(points) || points <= 0.f) return;
+    runtime.setActionStatus("声望添加请求已排队");
+    runtime.addReputationPoints[index] = std::min(points, 100.f);
 }
 void WeaponHooks::requestFreeHideoutUpgrade() {
     runtime.freeUpgradeRequested=true;runtime.setActionStatus("设施升级请求已排队");log("UI queued hideout-upgrade request\r\n");

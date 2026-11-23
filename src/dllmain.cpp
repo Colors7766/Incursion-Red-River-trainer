@@ -92,6 +92,13 @@ static void saveConfig(const Features& f) {
     file << "addMoneyAmount=" << f.addMoneyAmount << '\n';
     file << "addCoinAmount=" << f.addCoinAmount << '\n';
     file << "addExperienceAmount=" << f.addExperienceAmount << '\n';
+    file << "addMetalAmount=" << f.addMetalAmount << '\n';
+    file << "addOilAmount=" << f.addOilAmount << '\n';
+    file << "addConcreteAmount=" << f.addConcreteAmount << '\n';
+    file << "addFoodAmount=" << f.addFoodAmount << '\n';
+    file << "addUicsReputation=" << f.addUicsReputation << '\n';
+    file << "addVlfReputation=" << f.addVlfReputation << '\n';
+    file << "addIgcReputation=" << f.addIgcReputation << '\n';
     file << "gameSpeedMultiplier=" << f.gameSpeedMultiplier << '\n';
 }
 
@@ -113,6 +120,34 @@ static bool colorConfig(const char* label, float (&value)[4]) {
         ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_AlphaPreviewHalf)) return false;
     saveConfig(features);
     return true;
+}
+
+static bool inventoryAmountButton(const char* inputId, const char* buttonLabel, int& amount) {
+    ImGui::SetNextItemWidth(120.f);
+    ImGui::InputInt(inputId, &amount, 0, 0);
+    const bool edited = ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SameLine();
+    const bool pressed = ImGui::Button(buttonLabel);
+    if (edited || pressed) {
+        amount = std::clamp(amount, 1, 100000000);
+        saveConfig(features);
+    }
+    return pressed;
+}
+
+static bool inventoryAmountButton(const char* inputId, const char* buttonLabel, float& points) {
+    ImGui::SetNextItemWidth(120.f);
+    ImGui::InputFloat(inputId, &points, 0.f, 0.f, "%.2f", ImGuiInputTextFlags_CharsDecimal);
+    const bool edited = ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!std::isfinite(points) || points <= 0.f);
+    const bool pressed = ImGui::Button(buttonLabel);
+    ImGui::EndDisabled();
+    if (edited || pressed) {
+        points = std::isfinite(points) ? std::clamp(points, 0.f, 100.f) : 0.f;
+        saveConfig(features);
+    }
+    return pressed;
 }
 
 static void loadConfig(Features& f) {
@@ -171,6 +206,16 @@ static void loadConfig(Features& f) {
     amount("addMoneyAmount", f.addMoneyAmount);
     amount("addCoinAmount", f.addCoinAmount);
     amount("addExperienceAmount", f.addExperienceAmount);
+    amount("addMetalAmount", f.addMetalAmount);
+    amount("addOilAmount", f.addOilAmount);
+    amount("addConcreteAmount", f.addConcreteAmount);
+    amount("addFoodAmount", f.addFoodAmount);
+    real("addUicsReputation", f.addUicsReputation);
+    real("addVlfReputation", f.addVlfReputation);
+    real("addIgcReputation", f.addIgcReputation);
+    f.addUicsReputation = std::clamp(f.addUicsReputation, 0.f, 100.f);
+    f.addVlfReputation = std::clamp(f.addVlfReputation, 0.f, 100.f);
+    f.addIgcReputation = std::clamp(f.addIgcReputation, 0.f, 100.f);
     for (int i = 0; i < 4; ++i) {
         real("skeletonColor" + std::to_string(i), f.skeletonColor[i]);
         real("boxColor" + std::to_string(i), f.boxColor[i]);
@@ -310,14 +355,19 @@ static BOOL CALLBACK findGameWindow(HWND h, LPARAM data) {
 }
 
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (menu && ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return 1;
+    if ((menu || m == WM_KILLFOCUS) && ImGui_ImplWin32_WndProcHandler(h, m, w, l)) return 1;
     if (m == WM_DESTROY) { running = false; return 0; }
     return DefWindowProcW(h, m, w, l);
 }
 static void setInputMode() {
-    LONG ex = GetWindowLongW(overlayWindow, GWL_EXSTYLE);
-    if (menu) ex &= ~WS_EX_TRANSPARENT; else ex |= WS_EX_TRANSPARENT;
-    SetWindowLongW(overlayWindow, GWL_EXSTYLE, ex | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST);
+    constexpr LONG passiveStyles = WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    const bool menuOpen = menu.load();
+    const LONG ex = GetWindowLongW(overlayWindow, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOPMOST;
+    SetWindowLongW(overlayWindow, GWL_EXSTYLE,
+        menuOpen ? ex & ~passiveStyles : ex | passiveStyles);
+    SetWindowPos(overlayWindow, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (!menuOpen && GetForegroundWindow() == overlayWindow) SetForegroundWindow(gameWindow);
 }
 static bool createRenderTarget() {
     ID3D11Texture2D* back{};
@@ -586,20 +636,26 @@ static void render() {
             }
             if (ImGui::BeginTabItem("库存")) {
                 checkboxConfig("即时搜索", features.instantSearch);
-                ImGui::Separator();
-                ImGui::InputInt("金钱数量", &features.addMoneyAmount, 0, 0);
-                features.addMoneyAmount = std::clamp(features.addMoneyAmount, 1, 100000000);
-                if (ImGui::IsItemDeactivatedAfterEdit()) saveConfig(features);
-                if (ImGui::Button("添加金钱")) weaponHooks.requestAddMoney(features.addMoneyAmount);
-                ImGui::InputInt("标记硬币数量", &features.addCoinAmount, 0, 0);
-                features.addCoinAmount = std::clamp(features.addCoinAmount, 1, 100000000);
-                if (ImGui::IsItemDeactivatedAfterEdit()) saveConfig(features);
-                if (ImGui::Button("添加标记硬币")) weaponHooks.requestAddCoins(features.addCoinAmount);
-                ImGui::Separator();
-                ImGui::InputInt("经验数量", &features.addExperienceAmount, 0, 0);
-                features.addExperienceAmount = std::clamp(features.addExperienceAmount, 1, 100000000);
-                if (ImGui::IsItemDeactivatedAfterEdit()) saveConfig(features);
-                if (ImGui::Button("添加经验")) weaponHooks.requestAddExperience(features.addExperienceAmount);
+                if (inventoryAmountButton("##MoneyAmount", "添加金钱", features.addMoneyAmount))
+                    weaponHooks.requestAddMoney(features.addMoneyAmount);
+                if (inventoryAmountButton("##CoinAmount", "添加标记硬币", features.addCoinAmount))
+                    weaponHooks.requestAddCoins(features.addCoinAmount);
+                if (inventoryAmountButton("##ExperienceAmount", "添加经验", features.addExperienceAmount))
+                    weaponHooks.requestAddExperience(features.addExperienceAmount);
+                if (inventoryAmountButton("##MetalAmount", "添加金属", features.addMetalAmount))
+                    weaponHooks.requestAddResource(HideoutResource::Metal, features.addMetalAmount);
+                if (inventoryAmountButton("##OilAmount", "添加石油", features.addOilAmount))
+                    weaponHooks.requestAddResource(HideoutResource::Oil, features.addOilAmount);
+                if (inventoryAmountButton("##ConcreteAmount", "添加混凝土", features.addConcreteAmount))
+                    weaponHooks.requestAddResource(HideoutResource::Concrete, features.addConcreteAmount);
+                if (inventoryAmountButton("##FoodAmount", "添加食物", features.addFoodAmount))
+                    weaponHooks.requestAddResource(HideoutResource::Food, features.addFoodAmount);
+                if (inventoryAmountButton("##UicsReputation", "添加 UICS 声望", features.addUicsReputation))
+                    weaponHooks.requestAddReputation(Faction::Uics, features.addUicsReputation);
+                if (inventoryAmountButton("##VlfReputation", "添加 VLF 声望", features.addVlfReputation))
+                    weaponHooks.requestAddReputation(Faction::Vlf, features.addVlfReputation);
+                if (inventoryAmountButton("##IgcReputation", "添加 IGC 声望", features.addIgcReputation))
+                    weaponHooks.requestAddReputation(Faction::Igc, features.addIgcReputation);
                 if (ImGui::Button("免费升级当前据点设施")) weaponHooks.requestFreeHideoutUpgrade();
                 const auto inventoryStatus = weaponHooks.status();
                 if (!inventoryStatus.empty()) ImGui::TextUnformatted(inventoryStatus.c_str());
@@ -664,12 +720,13 @@ static DWORD WINAPI MainThread(void*) {
     RECT r{}; GetClientRect(gameWindow,&r); POINT p{0,0}; ClientToScreen(gameWindow,&p);
     overlayWindow=CreateWindowExW(WS_EX_TOPMOST|WS_EX_NOACTIVATE,wc.lpszClassName,L"",WS_POPUP,p.x,p.y,r.right,r.bottom,nullptr,nullptr,selfModule,nullptr);
     if (!overlayWindow) { initFailure("CreateWindowExW", HRESULT_FROM_WIN32(GetLastError())); UnregisterClassW(wc.lpszClassName,selfModule); FreeLibraryAndExitThread(selfModule, 1); }
-    ShowWindow(overlayWindow,SW_SHOW); setInputMode();
+    ShowWindow(overlayWindow, SW_SHOWNOACTIVATE); setInputMode();
     if (!initD3D() || !createRenderTarget()) {
         releaseGraphics(); DestroyWindow(overlayWindow); UnregisterClassW(wc.lpszClassName,selfModule); FreeLibraryAndExitThread(selfModule,1);
     }
     IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io=ImGui::GetIO(); io.IniFilename=nullptr; io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc",18.f,nullptr,io.Fonts->GetGlyphRangesChineseFull()); ImGui::StyleColorsDark(); ImGui_ImplWin32_Init(overlayWindow); ImGui_ImplDX11_Init(device,context); loadConfig(features); reader.initialize(); weaponHooks.update(features); weaponHooks.initialize(reader.moduleBase());
     bool lastIns=false,lastEnd=false; while(running) { bool ins=(GetAsyncKeyState(VK_INSERT)&1)!=0; bool end=(GetAsyncKeyState(VK_END)&1)!=0; if(ins&&!lastIns){menu=!menu;setInputMode();} if(end&&!lastEnd)running=false; lastIns=ins;lastEnd=end; MSG msg{}; while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);} render(); Sleep(1); }
+    if (menu.exchange(false) && IsWindow(overlayWindow)) setInputMode();
     weaponHooks.shutdown();
     injuryProtection.shutdown();
     reader.shutdown(); ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); releaseGraphics(); DestroyWindow(overlayWindow); UnregisterClassW(wc.lpszClassName,selfModule); FreeLibraryAndExitThread(selfModule,0); return 0;

@@ -78,6 +78,13 @@ struct Features {
     int addMoneyAmount{10000};
     int addCoinAmount{100};
     int addExperienceAmount{1000};
+    int addMetalAmount{100};
+    int addOilAmount{100};
+    int addConcreteAmount{100};
+    int addFoodAmount{100};
+    float addUicsReputation{10.f};
+    float addVlfReputation{10.f};
+    float addIgcReputation{10.f};
 };
 
 class GameReader {

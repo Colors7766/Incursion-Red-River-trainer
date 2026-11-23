@@ -27,11 +27,13 @@ PQOverlay 是为 **Incursion Red River** 编写的 Windows x64 游戏修改菜�
 .\build.ps1
 ```
 
-脚本会初始化 x64 编译环境并执行 Release 构建。如果 Visual Studio 安装在其他位置，可打开对应的 x64 开发者命令行，在源码目录手动运行：
+脚本会初始化 x64 编译环境并执行 Release 构建，将 `PQLoader.exe` 和 `PQOverlay.dll` 输出到当前用户桌面的 `build` 文件夹。如果 Visual Studio 安装在其他位置，可打开对应的 x64 开发者命令行，在源码目录手动运行：
 
 ```text
-cmake -S . -B "E:\BuildOutput\Incursion Red River" -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build "E:\BuildOutput\Incursion Red River"
+$output = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)) "build"
+$buildDirectory = Join-Path $output ".cmake"
+cmake -S . -B "$buildDirectory" -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY=$output"
+cmake --build "$buildDirectory" --config Release
 ```
 
 ## 各部分负责什么
