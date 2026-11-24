@@ -328,12 +328,17 @@ public:
                 }
             }
         }
+        // Only opening the menu requests a game-time read; speed maintenance
+        // must not continuously refresh the time slider's cached value.
+        if (!refresh && hour<0) return;
         int minuteOfDay=-1;
         const auto worldManager=contextResult(missionLibrary,"GetIRRWorldManager",world.address);
         if (isA(worldManager,"IRRWorldManager")) {
             // The native setter updates RuntimeDayTime and runs the game's day/night update.
-            if (hour>=0 && hour<24 && isA(instance,"GeneralGameInstance"))
-                invoke(instance,"SetTimeOfDay",&hour,sizeof(hour));
+            if (hour>=0 && hour<24 && isA(instance,"GeneralGameInstance") &&
+                invoke(instance,"SetTimeOfDay",&hour,sizeof(hour)))
+                currentWorldMinute=hour*60;
+            if (!refresh) return;
             // Read RuntimeDayTime with the current map's time-zone adjustment.
             struct LocalTime {
                 uint64_t useSecondTimeZone,header;
@@ -344,7 +349,7 @@ public:
                 time.hours>=0 && time.hours<24 && time.minutes>=0 && time.minutes<60)
                 minuteOfDay=time.hours*60+time.minutes;
         }
-        currentWorldMinute=minuteOfDay;
+        if (refresh) currentWorldMinute=minuteOfDay;
     }
     void restoreSearchTime() {
         if (alive(searchSettings)) {

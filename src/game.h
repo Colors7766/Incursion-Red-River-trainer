@@ -79,6 +79,8 @@ struct Features {
     float gameSpeedMultiplier{1.f};
     int teleportKey{VK_F6};
     bool captureTeleportKey{false};
+    int safeBoxTeleportKey{VK_F7};
+    bool captureSafeBoxTeleportKey{false};
     bool weaponInfiniteAmmo{};
     bool weaponInfiniteGrenades{};
     bool weaponInfiniteDurability{};
@@ -112,6 +114,7 @@ public:
     uintptr_t localAbilityComponent() const { return localAbilityComponent_; }
     uintptr_t moduleBase() const { return module_; }
     bool teleportToMarker();
+    bool teleportToSafeBox(int width, int height);
     void aim(const Features& features, HWND targetWindow, bool menuOpen = false);
     float aimRadiusPixels(int width, const Features& features) const;
 private:

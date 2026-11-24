@@ -30,6 +30,8 @@ static WeaponHooks weaponHooks;
 static bool captureKeyWasDown[256]{};
 static bool captureTeleportKeyWasDown[256]{};
 static bool teleportKeyWasDown{};
+static bool captureSafeBoxTeleportKeyWasDown[256]{};
+static bool safeBoxTeleportKeyWasDown{};
 
 static void appendOverlayLog(const char* line, DWORD length);
 
@@ -84,6 +86,7 @@ static void saveConfig(const Features& f) {
     file << "playerSpeedMultiplier=" << f.playerSpeedMultiplier << '\n';
     file << "playerJumpHeightMultiplier=" << f.playerJumpHeightMultiplier << '\n';
     file << "teleportKey=" << f.teleportKey << '\n';
+    file << "safeBoxTeleportKey=" << f.safeBoxTeleportKey << '\n';
     file << "weaponInfiniteAmmo=" << int(f.weaponInfiniteAmmo) << '\n';
     file << "weaponInfiniteGrenades=" << int(f.weaponInfiniteGrenades) << '\n';
     file << "weaponInfiniteDurability=" << int(f.weaponInfiniteDurability) << '\n';
@@ -202,8 +205,10 @@ static void loadConfig(Features& f) {
     boolean("weaponOneHitKill", f.weaponOneHitKill);
     boolean("instantSearch", f.instantSearch);
     integer("aimBone", f.aimBone); integer("aimKey", f.aimKey); integer("teleportKey", f.teleportKey);
+    integer("safeBoxTeleportKey", f.safeBoxTeleportKey);
     real("espDistance", f.espDistance); real("aimDistance", f.aimDistance); real("aimFov", f.aimFov);
     real("corpseDistance", f.corpseDistance); real("playerSpeedMultiplier", f.playerSpeedMultiplier);
+    real("safeBoxDistance", f.safeBoxDistance);
     real("playerJumpHeightMultiplier", f.playerJumpHeightMultiplier);
     real("meleeAttackSpeedMultiplier", f.meleeAttackSpeedMultiplier);
     real("gameSpeedMultiplier", f.gameSpeedMultiplier);
@@ -283,6 +288,8 @@ static void updateAimKeyCapture() {
 }
 
 static void beginAimKeyCapture() {
+    features.captureTeleportKey = false;
+    features.captureSafeBoxTeleportKey = false;
     for (int key = 1; key < 256; ++key) captureKeyWasDown[key] = (GetAsyncKeyState(key) & 0x8000) != 0;
     features.captureAimKey = true;
 }
@@ -306,9 +313,37 @@ static void updateTeleportKeyCapture() {
 }
 
 static void beginTeleportKeyCapture() {
+    features.captureAimKey = false;
+    features.captureSafeBoxTeleportKey = false;
     for (int key = 1; key < 256; ++key)
         captureTeleportKeyWasDown[key] = (GetAsyncKeyState(key) & 0x8000) != 0;
     features.captureTeleportKey = true;
+}
+
+static void updateSafeBoxTeleportKeyCapture() {
+    if (!features.captureSafeBoxTeleportKey) return;
+    for (int key = 1; key < 256; ++key) {
+        const bool down = (GetAsyncKeyState(key) & 0x8000) != 0;
+        if (down && !captureSafeBoxTeleportKeyWasDown[key]) {
+            if (key == VK_ESCAPE) features.captureSafeBoxTeleportKey = false;
+            else {
+                features.safeBoxTeleportKey = key;
+                features.captureSafeBoxTeleportKey = false;
+                safeBoxTeleportKeyWasDown = true;
+                saveConfig(features);
+            }
+            break;
+        }
+        captureSafeBoxTeleportKeyWasDown[key] = down;
+    }
+}
+
+static void beginSafeBoxTeleportKeyCapture() {
+    features.captureAimKey = false;
+    features.captureTeleportKey = false;
+    for (int key = 1; key < 256; ++key)
+        captureSafeBoxTeleportKeyWasDown[key] = (GetAsyncKeyState(key) & 0x8000) != 0;
+    features.captureSafeBoxTeleportKey = true;
 }
 
 static const char* aimKeyLabel(int key) {
@@ -572,17 +607,24 @@ static void render() {
     int w=0,h=0; RECT gr{}; GetClientRect(gameWindow,&gr); w=gr.right; h=gr.bottom; POINT p{0,0}; ClientToScreen(gameWindow,&p); SetWindowPos(overlayWindow,HWND_TOPMOST,p.x,p.y,w,h,SWP_NOACTIVATE);
     reader.update(w,h,features);
     injuryProtection.update(reader.localAbilityComponent(), features.preventBleeding, features.preventFracture);
+    const bool capturingKey = features.captureAimKey || features.captureTeleportKey || features.captureSafeBoxTeleportKey;
     updateTeleportKeyCapture();
+    updateSafeBoxTeleportKeyCapture();
     const bool menuOpen=menu.load();
     static bool lastMenuOpen=false;
     if (menuOpen && !lastMenuOpen) weaponHooks.refreshWorldTime();
     lastMenuOpen=menuOpen;
     weaponHooks.update(features);
-    if (!features.captureTeleportKey) {
+    if (!capturingKey) {
         const bool down = (GetAsyncKeyState(features.teleportKey) & 0x8000) != 0;
         if (down && !teleportKeyWasDown) reader.teleportToMarker();
         teleportKeyWasDown = down;
     }
+    const bool safeTeleportDown = (GetAsyncKeyState(features.safeBoxTeleportKey) & 0x8000) != 0;
+    if (!capturingKey && !menuOpen && GetForegroundWindow() == gameWindow &&
+        safeTeleportDown && !safeBoxTeleportKeyWasDown)
+        reader.teleportToSafeBox(w, h);
+    safeBoxTeleportKeyWasDown = safeTeleportDown;
     reader.aim(features, gameWindow, menu);
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     const auto drawCounts = drawEsp(ImGui::GetBackgroundDrawList(),w,h);
@@ -645,6 +687,12 @@ static void render() {
                 if (ImGui::Button(features.captureTeleportKey ? "按任意键..." :
                     aimKeyLabel(features.teleportKey))) beginTeleportKeyCapture();
                 if (const char* status = injuryProtection.status()) ImGui::TextUnformatted(status);
+                ImGui::PushID("SafeBoxTeleport");
+                if (ImGui::Button("传送到保险箱")) reader.teleportToSafeBox(w, h);
+                ImGui::SameLine();
+                if (ImGui::Button(features.captureSafeBoxTeleportKey ? "按任意键..." :
+                    aimKeyLabel(features.safeBoxTeleportKey))) beginSafeBoxTeleportKeyCapture();
+                ImGui::PopID();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("武器")) {

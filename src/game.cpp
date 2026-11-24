@@ -109,6 +109,132 @@ bool GameReader::teleportToMarker() {
     return relativeWritten && worldWritten;
 }
 
+bool GameReader::teleportToSafeBox(int width, int height) {
+    if (!worldGlobal_ || !camera_.valid || width <= 0 || height <= 0 ||
+        !validObject(localPawn_)) return false;
+    const auto pawn = localPawn_;
+    const auto world = value<uintptr_t>(worldGlobal_);
+    const auto level = validObject(world) ? value<uintptr_t>(world + o_.persistentLevel) : 0;
+    if (!validObject(level)) return false;
+    struct ActorArray { uintptr_t data; int32_t count, max; } actors{};
+    if (!read(level + o_.levelActors, &actors, sizeof(actors)) || actors.count <= 0 ||
+        actors.count > 65536 || actors.max < actors.count || !valid(actors.data)) return false;
+
+    const auto pawnRoot = value<uintptr_t>(pawn + o_.actorRoot);
+    BoneTransform pawnTransform{};
+    if (!validObject(pawnRoot) || value<uintptr_t>(pawnRoot + 0x20) != pawn ||
+        !read(pawnRoot + o_.componentToWorld, &pawnTransform, sizeof(pawnTransform)) ||
+        !finiteTransform(pawnTransform)) return false;
+    const auto capsuleOffset = fieldOffset(value<uintptr_t>(pawn + 0x10), "CapsuleComponent", nullptr, sizeof(uintptr_t));
+    const auto capsule = capsuleOffset ? value<uintptr_t>(pawn + capsuleOffset) : 0;
+    if (!validObject(capsule) || capsule != pawnRoot) return false;
+    const auto halfHeightOffset = fieldOffset(value<uintptr_t>(capsule + 0x10), "CapsuleHalfHeight", nullptr, sizeof(float));
+    float halfHeight{};
+    if (!halfHeightOffset || !read(capsule + halfHeightOffset, &halfHeight, sizeof(halfHeight)) ||
+        !std::isfinite(halfHeight) || halfHeight <= 0.f || halfHeight > 500.f) return false;
+    const auto rotationOffset = fieldOffset(value<uintptr_t>(capsule + 0x10), "RelativeRotation", nullptr, sizeof(Rotator));
+    Rotator control{};
+    if (!rotationOffset || !o_.controlRotation || !validObject(controller_) ||
+        value<uintptr_t>(controller_ + o_.acknowledgedPawn) != pawn ||
+        !read(controller_ + o_.controlRotation, &control, sizeof(control)) ||
+        !std::isfinite(control.pitch) || !std::isfinite(control.yaw) || !std::isfinite(control.roll)) return false;
+
+    const double aimRadius = (std::max)(32.0, height * .06);
+    double nearestScreenSquared = aimRadius * aimRadius;
+    double nearestWorldSquared{};
+    uintptr_t selected{};
+    // Scan on demand so this action does not depend on the ESP toggle or cache.
+    for (int32_t i = 0; i < actors.count; ++i) {
+        const auto actor = value<uintptr_t>(actors.data + uintptr_t(i) * sizeof(uintptr_t));
+        if (!validObject(actor)) continue;
+        const auto type = className(actor);
+        if (type != "BP_LootContainer_Safe_01_C" && type != "BP_LootContainer_Safe_02_C") continue;
+        const auto root = value<uintptr_t>(actor + o_.actorRoot);
+        BoneTransform transform{};
+        if (!validObject(root) || value<uintptr_t>(root + 0x20) != actor ||
+            !read(root + o_.componentToWorld, &transform, sizeof(transform)) ||
+            !finiteTransform(transform)) continue;
+        POINT screen{};
+        if (!project(transform.translation, screen, width, height) ||
+            screen.x < 0 || screen.x > width || screen.y < 0 || screen.y > height) continue;
+        const double dx = transform.translation.x - camera_.location.x;
+        const double dy = transform.translation.y - camera_.location.y;
+        const double dz = transform.translation.z - camera_.location.z;
+        const double worldSquared = dx * dx + dy * dy + dz * dz;
+        const double sx = screen.x - width * .5, sy = screen.y - height * .5;
+        const double screenSquared = sx * sx + sy * sy;
+        if (screenSquared > nearestScreenSquared ||
+            (selected && screenSquared == nearestScreenSquared && worldSquared >= nearestWorldSquared)) continue;
+        nearestScreenSquared = screenSquared;
+        nearestWorldSquared = worldSquared;
+        selected = actor;
+    }
+    if (!selected || !validObject(selected) || value<uintptr_t>(worldGlobal_) != world || localPawn_ != pawn) return false;
+
+    const auto meshOffset = fieldOffset(value<uintptr_t>(selected + 0x10), "Cube", nullptr, sizeof(uintptr_t));
+    const auto mesh = meshOffset ? value<uintptr_t>(selected + meshOffset) : 0;
+    BoneTransform meshTransform{};
+    if (!validObject(mesh) || value<uintptr_t>(mesh + 0x20) != selected ||
+        !read(mesh + o_.componentToWorld, &meshTransform, sizeof(meshTransform)) ||
+        !finiteTransform(meshTransform) || std::abs(meshTransform.scale.y) < .001) return false;
+    const auto assetOffset = fieldOffset(value<uintptr_t>(mesh + 0x10), "StaticMesh", nullptr, sizeof(uintptr_t));
+    const auto asset = assetOffset ? value<uintptr_t>(mesh + assetOffset) : 0;
+    if (!validObject(asset)) return false;
+    const auto assetName = name(value<uint32_t>(asset + 0x18));
+    // Both verified safe meshes have their door and interaction marker on local +Y.
+    if (assetName != "SM_Safe_01" && assetName != "SM_Safe_02") return false;
+    struct MeshBounds { Vec3 origin, extent; double radius; } bounds{};
+    static_assert(sizeof(MeshBounds) == 56);
+    uintptr_t boundsType{};
+    const auto boundsOffset = fieldOffset(value<uintptr_t>(asset + 0x10), "ExtendedBounds", &boundsType, sizeof(bounds));
+    if (!boundsOffset || !validObject(boundsType) || name(value<uint32_t>(boundsType + 0x18)) != "BoxSphereBounds" ||
+        !read(asset + boundsOffset, &bounds, sizeof(bounds)) ||
+        !std::isfinite(bounds.origin.x) || !std::isfinite(bounds.origin.y) || !std::isfinite(bounds.origin.z) ||
+        !std::isfinite(bounds.extent.x) || !std::isfinite(bounds.extent.y) || !std::isfinite(bounds.extent.z) ||
+        bounds.extent.x <= 0.0 || bounds.extent.y <= 0.0 || bounds.extent.z <= 0.0) return false;
+    const auto meshPoint = [&](Vec3 local) {
+        const auto offset = rotate(meshTransform.rotation, {local.x * meshTransform.scale.x,
+            local.y * meshTransform.scale.y, local.z * meshTransform.scale.z});
+        return Vec3{meshTransform.translation.x + offset.x, meshTransform.translation.y + offset.y,
+            meshTransform.translation.z + offset.z};
+    };
+    const Vec3 frontBase = meshPoint({bounds.origin.x, bounds.origin.y + bounds.extent.y,
+        bounds.origin.z - bounds.extent.z});
+    const Vec3 frontCenter = meshPoint({bounds.origin.x, bounds.origin.y + bounds.extent.y, bounds.origin.z});
+    const Vec3 normal = rotate(meshTransform.rotation, {0.0, meshTransform.scale.y > 0.0 ? 1.0 : -1.0, 0.0});
+    const double horizontalLength = std::hypot(normal.x, normal.y);
+    if (!std::isfinite(horizontalLength) || horizontalLength < .001) return false;
+    const double frontX = normal.x / horizontalLength, frontY = normal.y / horizontalLength;
+    constexpr double standOff = 100.0; // One meter outside the door face, independent of the player's position.
+    const Vec3 destination{
+        frontBase.x + frontX * standOff,
+        frontBase.y + frontY * standOff,
+        frontBase.z + halfHeight * std::abs(pawnTransform.scale.z) + 5.0
+    };
+    const Rotator facing{0.0, std::atan2(-frontY, -frontX) * 180.0 / pi, 0.0};
+    const double halfYaw = rad(facing.yaw) * .5;
+    const double rotation[4]{0.0, 0.0, std::sin(halfYaw), std::cos(halfYaw)};
+    const Vec3 eye{destination.x + camera_.location.x - pawnTransform.translation.x,
+        destination.y + camera_.location.y - pawnTransform.translation.y,
+        destination.z + camera_.location.z - pawnTransform.translation.z};
+    const double aimX = frontCenter.x - eye.x, aimY = frontCenter.y - eye.y;
+    const double aimFlat = std::hypot(aimX, aimY);
+    if (!std::isfinite(aimFlat) || aimFlat < .001) return false;
+    Rotator view = control;
+    view.yaw = std::remainder(std::atan2(aimY, aimX) * 180.0 / pi +
+        std::remainder(control.yaw - camera_.rotation.yaw, 360.0), 360.0);
+    view.pitch = std::clamp(std::atan2(frontCenter.z - eye.z, aimFlat) * 180.0 / pi +
+        std::remainder(control.pitch - camera_.rotation.pitch, 360.0), -89.0, 89.0);
+    const bool relativeWritten = writeLocal(pawnRoot + 0x140, &destination, sizeof(destination));
+    const bool worldWritten = writeLocal(pawnRoot + o_.componentToWorld + 0x20, &destination, sizeof(destination));
+    const bool relativeRotated = writeLocal(pawnRoot + rotationOffset, &facing, sizeof(facing));
+    const bool worldRotated = writeLocal(pawnRoot + o_.componentToWorld, &rotation, sizeof(rotation));
+    const bool viewRotated = writeLocal(controller_ + o_.controlRotation, &view, sizeof(view));
+    lockedActor_ = 0;
+    lastAimTimestamp_ = cameraTimestamp_;
+    return relativeWritten && worldWritten && relativeRotated && worldRotated && viewRotated;
+}
+
 bool GameReader::writeLocal(uintptr_t address, const void* data, size_t size) const {
     if (!address || !data || !size || address > 0x7FFFFFFFFFFFULL - size) return false;
     __try { std::memcpy(reinterpret_cast<void*>(address), data, size); return true; }
