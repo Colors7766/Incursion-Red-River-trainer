@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
 #include <mutex>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -86,6 +88,7 @@ struct Snapshot {
     bool ammo{},grenades{},durability{},recoil{},spread{},oneHit{},instantSearch{};
     float melee{1.f}; bool operator==(const Snapshot&) const=default;
 };
+struct WeatherOption { uintptr_t preset{}; std::string label; };
 using Tick=void(__fastcall*)(void*,float,uint32_t,void*);
 using Getter=float(__fastcall*)(void*);
 using GetterArg=float(__fastcall*)(void*,void*);
@@ -119,6 +122,8 @@ public:
     std::atomic<float> requestedGameSpeed{1.f};
     std::atomic_int requestedHour{-1},currentWorldMinute{-1};
     std::atomic_bool worldTimeRefreshRequested{};
+    std::atomic_bool weatherRequestRequested{};
+    std::atomic_int requestedWeatherIndex{};
     std::atomic_uintptr_t localWeapon{},localInventory{},localController{};
     std::atomic_int killed{-1};
     std::atomic_bool killRequested{};
@@ -132,6 +137,12 @@ public:
     Object world{},pawn{},core{},inventory{},stash{},manager{},equipped{},lastRateWeapon{};
     Object searchSettings{};
     Object speedWorld{};
+    Object weatherActor{};
+    uintptr_t weatherSetterParameter{};
+    std::string weatherSetterName,weatherStatusText;
+    std::vector<WeatherOption> weatherEntries;
+    ULONGLONG nextWeatherProbe{};
+    bool weatherGlobalScanDone{};
     float originalGameSpeed{};
     ULONGLONG nextWorldUpdate{};
     float originalSearchTime{},appliedSearchTime{};
@@ -305,6 +316,122 @@ public:
         static_assert(offsetof(Params,value)==8);
         if (!gameplayStatics || !alive(target) || !invoke(gameplayStatics,operation,&p,0x0c)) return false;
         value=p.value;return true;
+    }
+    std::string weatherLabel(std::string value) {
+        std::string lower=value;
+        std::transform(lower.begin(),lower.end(),lower.begin(),[](unsigned char c){return char(std::tolower(c));});
+        if (lower.find("clear")!=std::string::npos || lower.find("sunny")!=std::string::npos) return "晴朗";
+        if (lower.find("overcast")!=std::string::npos) return "阴天";
+        if (lower.find("cloud")!=std::string::npos) return "多云";
+        if (lower.find("fog")!=std::string::npos) return "雾";
+        if (lower.find("snow")!=std::string::npos || lower.find("blizzard")!=std::string::npos) return "降雪";
+        if (lower.find("dust")!=std::string::npos) return lower.find("storm")!=std::string::npos ? "沙尘暴" : "浮尘";
+        if (lower.find("storm")!=std::string::npos || lower.find("thunder")!=std::string::npos) return "雷暴";
+        if (lower.find("rain")!=std::string::npos) {
+            if (lower.find("heavy")!=std::string::npos || lower.find("strong")!=std::string::npos) return "暴雨";
+            if (lower.find("light")!=std::string::npos) return "小雨";
+            return "降雨";
+        }
+        std::replace(value.begin(),value.end(),'_',' ');
+        return value;
+    }
+    void setWeatherStatus(const std::string& text) {
+        std::lock_guard lock(statusMutex);
+        weatherStatusText=text;
+    }
+    std::vector<WeatherOption> findWeatherPresets() {
+        std::vector<WeatherOption> options;
+        const auto chunks=get<uintptr_t>(module+objectsRva);
+        const auto count=get<int32_t>(module+objectsRva+20);
+        if (!chunks || count<=0 || count>4000000) return options;
+        std::unordered_set<uintptr_t> seen;
+        std::unordered_set<std::string> seenLabels;
+        for (int32_t i=0;i<count;++i) {
+            const auto chunk=get<uintptr_t>(chunks+uintptr_t(i/65536)*8);
+            if (!chunk) continue;
+            const auto address=get<uintptr_t>(chunk+uintptr_t(i%65536)*24);
+            if (!object(address).address || !isA(address,"IRRWeatherSettings")) continue;
+            const auto label=objectName(address);
+            const auto className=objectName(cls(address));
+            if (label.empty() || label==className || label.rfind("Default__",0)==0 ||
+                label.rfind("NewEnumerator",0)==0 || !seen.emplace(address).second) continue;
+            const auto display=weatherLabel(label);
+            if (!seenLabels.emplace(display).second) continue;
+            options.push_back({address,display});
+        }
+        const auto order=[](const std::string& label) {
+            static constexpr const char* labels[]={"晴朗","多云","阴天","雾","小雨","降雨","雷暴","降雪","沙尘暴","浮尘"};
+            for (int i=0;i<static_cast<int>(std::size(labels));++i) if (label==labels[i]) return i;
+            return 100;
+        };
+        std::stable_sort(options.begin(),options.end(),[&](const auto& a,const auto& b){
+            const auto ao=order(a.label),bo=order(b.label);
+            return ao==bo ? a.label<b.label : ao<bo;
+        });
+        return options;
+    }
+    bool discoverWeatherInterface() {
+        if (!alive(world)) return false;
+        Object actor{};
+        const auto level=referenced(world.address,"PersistentLevel");
+        const auto actorsField=level ? field(cls(level),"Actors") : Field{};
+        if (level && actorsField) {
+            const auto actors=array(level+actorsField.offset,65536);
+            for (int i=0;i<actors.count;++i) {
+                const auto candidate=object(get<uintptr_t>(actors.data+uintptr_t(i)*8));
+                if (candidate.address && objectName(cls(candidate.address)).find("BP_IRR_UDS_DynamicWeather")!=std::string::npos) {
+                    actor=candidate;break;
+                }
+            }
+        }
+        if (!actor.address && !weatherGlobalScanDone) {
+            weatherGlobalScanDone=true;
+            const auto chunks=get<uintptr_t>(module+objectsRva);
+            const auto count=get<int32_t>(module+objectsRva+20);
+            if (chunks && count>0 && count<=4000000) {
+                for (int32_t i=0;i<count;++i) {
+                    const auto chunk=get<uintptr_t>(chunks+uintptr_t(i/65536)*8);
+                    if (!chunk) continue;
+                    const auto candidate=object(get<uintptr_t>(chunk+uintptr_t(i%65536)*24));
+                    if (!candidate.address || objectName(cls(candidate.address)).find("BP_IRR_UDS_DynamicWeather")==std::string::npos) continue;
+                    actor=candidate;break;
+                }
+            }
+        }
+        if (!actor.address) return false;
+        weatherActor=actor;
+        weatherSetterName="Change Weather";
+        const auto setter=function(cls(actor.address),weatherSetterName.c_str());
+        const auto newWeather=field(setter,"New Weather Type");
+        const auto transition=field(setter,"Time To Transition To New Weather (Seconds)");
+        if (!newWeather || !transition || newWeather.size!=sizeof(uintptr_t) || transition.size!=sizeof(double)) return false;
+        if (newWeather.offset!=0 || transition.offset!=sizeof(uintptr_t)) return false;
+        weatherSetterParameter=newWeather.property;
+        weatherEntries=findWeatherPresets();
+        return !weatherEntries.empty();
+    }
+    void updateWeatherControl() {
+        const auto now=GetTickCount64();
+        if ((!alive(weatherActor) || weatherEntries.empty() || !weatherSetterParameter) && now>=nextWeatherProbe) {
+            nextWeatherProbe=now+(weatherGlobalScanDone ? 5000 : 1000);
+            if (!alive(weatherActor)) {
+                weatherActor={};weatherSetterParameter=0;weatherSetterName.clear();weatherEntries.clear();
+            }
+            if (!discoverWeatherInterface()) setWeatherStatus("当前地图天气接口未就绪");
+            else setWeatherStatus("天气接口已就绪");
+        }
+        if (!weatherRequestRequested.exchange(false)) return;
+        if (!alive(weatherActor) || weatherEntries.empty() || !weatherSetterParameter) {
+            setWeatherStatus("当前地图天气接口未就绪");return;
+        }
+        const int index=std::clamp(requestedWeatherIndex.load(),0,static_cast<int>(weatherEntries.size())-1);
+        const auto selected=weatherEntries[index];
+        struct ChangeWeatherParams { uintptr_t preset; double transition; } params{selected.preset,1.0};
+        static_assert(sizeof(ChangeWeatherParams)==0x10);
+        if (!invoke(weatherActor.address,weatherSetterName.c_str(),&params,sizeof(params))) {
+            setWeatherStatus("天气切换失败");return;
+        }
+        setWeatherStatus("当前天气："+selected.label);
     }
     void restoreGameSpeed() {
         if (!speedWorld.address) return;
@@ -880,6 +1007,9 @@ public:
     }
     void reset() {
         restoreGameSpeed();currentWorldMinute=-1;nextWorldUpdate=0;
+        weatherActor={};weatherSetterParameter=0;weatherSetterName.clear();weatherEntries.clear();
+        weatherGlobalScanDone=false;nextWeatherProbe=0;weatherRequestRequested=false;
+        setWeatherStatus("");
         restoreAmmo();restoreMontages();restoreSearchTime();grenades.clear();
         localWeapon=0;localInventory=0;localController=0;
         core={};pawn={};inventory={};stash={};manager={};equipped={};lastRateWeapon={};lastSlowTick=0;lastLookup=0;
@@ -922,6 +1052,7 @@ public:
         const auto now=GetTickCount64();
         findLibraries();
         updateWorldFeatures(instance,now);
+        updateWeatherControl();
         auto currentInventory=contextResult(inventoryLibrary,"GetPlayerInventoryComponent",pawn.address);
         if (!currentInventory) currentInventory=referenced(pawn.address,"BP_InventoryComponent");
         if (object(currentInventory)!=inventory) {restoreAmmo();grenades.clear();inventory=object(currentInventory);}
@@ -1123,6 +1254,7 @@ bool WeaponHooks::initialize(uintptr_t module) {
 void WeaponHooks::update(const Features& f) {
     runtime.requestedGameSpeed=std::isfinite(f.gameSpeedMultiplier)
         ? std::clamp(f.gameSpeedMultiplier,.1f,5.f) : 1.f;
+    runtime.requestedWeatherIndex=std::clamp(f.weatherIndex,0,255);
     std::lock_guard lock(runtime.requestMutex);
     runtime.requested={f.weaponInfiniteAmmo,f.weaponInfiniteGrenades,f.weaponInfiniteDurability,
         f.weaponNoRecoil,f.weaponNoSpread,f.weaponOneHitKill,f.instantSearch,
@@ -1157,7 +1289,20 @@ void WeaponHooks::requestFreeHideoutUpgrade() {
     runtime.freeUpgradeRequested=true;runtime.setActionStatus("设施升级请求已排队");log("UI queued hideout-upgrade request\r\n");
 }
 void WeaponHooks::requestSetTimeOfDay(int hour) {runtime.requestedHour=std::clamp(hour,0,23);}
+void WeaponHooks::requestSetWeather(int index) {
+    runtime.requestedWeatherIndex=std::clamp(index,0,255);
+    runtime.weatherRequestRequested=true;
+}
 void WeaponHooks::refreshWorldTime() {runtime.currentWorldMinute=-1;runtime.worldTimeRefreshRequested=true;}
+std::vector<std::string> WeaponHooks::weatherOptions() const {
+    std::lock_guard lock(runtime.stateMutex);
+    std::vector<std::string> result;result.reserve(runtime.weatherEntries.size());
+    for (const auto& option:runtime.weatherEntries) result.push_back(option.label);
+    return result;
+}
+std::string WeaponHooks::weatherStatus() const {
+    std::lock_guard lock(runtime.statusMutex);return runtime.weatherStatusText;
+}
 int WeaponHooks::currentWorldMinute() const {return runtime.currentWorldMinute.load();}
 int WeaponHooks::lastKillCount() const {return runtime.killed.load();}
 std::string WeaponHooks::status() const {

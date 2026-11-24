@@ -106,6 +106,7 @@ static void saveConfig(const Features& f) {
     file << "addVlfReputation=" << f.addVlfReputation << '\n';
     file << "addIgcReputation=" << f.addIgcReputation << '\n';
     file << "gameSpeedMultiplier=" << f.gameSpeedMultiplier << '\n';
+    file << "weatherIndex=" << f.weatherIndex << '\n';
 }
 
 static bool checkboxConfig(const char* label, bool& value) {
@@ -206,6 +207,7 @@ static void loadConfig(Features& f) {
     boolean("instantSearch", f.instantSearch);
     integer("aimBone", f.aimBone); integer("aimKey", f.aimKey); integer("teleportKey", f.teleportKey);
     integer("safeBoxTeleportKey", f.safeBoxTeleportKey);
+    integer("weatherIndex", f.weatherIndex);
     real("espDistance", f.espDistance); real("aimDistance", f.aimDistance); real("aimFov", f.aimFov);
     real("corpseDistance", f.corpseDistance); real("playerSpeedMultiplier", f.playerSpeedMultiplier);
     real("safeBoxDistance", f.safeBoxDistance);
@@ -401,6 +403,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 static void setInputMode() {
+    static int cursorShowCalls{};
     constexpr LONG passiveStyles = WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
     const bool menuOpen = menu.load();
     const LONG ex = GetWindowLongW(overlayWindow, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOPMOST;
@@ -408,7 +411,27 @@ static void setInputMode() {
         menuOpen ? ex & ~passiveStyles : ex | passiveStyles);
     SetWindowPos(overlayWindow, nullptr, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    if (!menuOpen && GetForegroundWindow() == overlayWindow) SetForegroundWindow(gameWindow);
+    if (menuOpen) {
+        SetForegroundWindow(overlayWindow);
+        SetActiveWindow(overlayWindow);
+        SetFocus(overlayWindow);
+        ClipCursor(nullptr);
+        if (!cursorShowCalls) {
+            int cursorCount;
+            do {
+                cursorCount = ShowCursor(TRUE);
+                ++cursorShowCalls;
+            } while (cursorCount < 0);
+        }
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    } else {
+        if (GetCapture() == overlayWindow) ReleaseCapture();
+        while (cursorShowCalls > 0) {
+            ShowCursor(FALSE);
+            --cursorShowCalls;
+        }
+        if (GetForegroundWindow() == overlayWindow) SetForegroundWindow(gameWindow);
+    }
 }
 static bool createRenderTarget() {
     ID3D11Texture2D* back{};
@@ -745,6 +768,31 @@ static void render() {
                 worldTabVisible=true;
                 sliderConfig("游戏速度", features.gameSpeedMultiplier, 0.1f, 5.f, "%.2f×",
                     ImGuiSliderFlags_AlwaysClamp);
+                const auto weatherOptions = weaponHooks.weatherOptions();
+                if (!weatherOptions.empty()) {
+                    features.weatherIndex = std::clamp(features.weatherIndex, 0,
+                        static_cast<int>(weatherOptions.size()) - 1);
+                    std::vector<const char*> weatherLabels;
+                    weatherLabels.reserve(weatherOptions.size());
+                    for (const auto& option : weatherOptions) weatherLabels.push_back(option.c_str());
+                    if (ImGui::Combo("天气", &features.weatherIndex, weatherLabels.data(),
+                        static_cast<int>(weatherLabels.size()))) saveConfig(features);
+                    ImGui::SameLine();
+                    if (ImGui::Button("确定")) {
+                        saveConfig(features);
+                        weaponHooks.requestSetWeather(features.weatherIndex);
+                    }
+                } else {
+                    int unavailable = 0;
+                    const char* unavailableLabel[] = {"当前地图天气接口未就绪"};
+                    ImGui::BeginDisabled();
+                    ImGui::Combo("天气", &unavailable, unavailableLabel, 1);
+                    ImGui::SameLine();
+                    ImGui::Button("确定");
+                    ImGui::EndDisabled();
+                }
+                const auto weatherStatus = weaponHooks.weatherStatus();
+                if (!weatherStatus.empty()) ImGui::TextUnformatted(weatherStatus.c_str());
                 const int minute=weaponHooks.currentWorldMinute();
                 static int selectedHour{};
                 if (!timeDragging && minute>=0) selectedHour=minute/60;
@@ -800,11 +848,12 @@ static DWORD WINAPI MainThread(void*) {
     RECT r{}; GetClientRect(gameWindow,&r); POINT p{0,0}; ClientToScreen(gameWindow,&p);
     overlayWindow=CreateWindowExW(WS_EX_TOPMOST|WS_EX_NOACTIVATE,wc.lpszClassName,L"",WS_POPUP,p.x,p.y,r.right,r.bottom,nullptr,nullptr,selfModule,nullptr);
     if (!overlayWindow) { initFailure("CreateWindowExW", HRESULT_FROM_WIN32(GetLastError())); UnregisterClassW(wc.lpszClassName,selfModule); FreeLibraryAndExitThread(selfModule, 1); }
-    ShowWindow(overlayWindow, SW_SHOWNOACTIVATE); setInputMode();
+    ShowWindow(overlayWindow, SW_SHOWNOACTIVATE);
     if (!initD3D() || !createRenderTarget()) {
         releaseGraphics(); DestroyWindow(overlayWindow); UnregisterClassW(wc.lpszClassName,selfModule); FreeLibraryAndExitThread(selfModule,1);
     }
     IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io=ImGui::GetIO(); io.IniFilename=nullptr; io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\msyh.ttc",18.f,nullptr,io.Fonts->GetGlyphRangesChineseFull()); ImGui::StyleColorsDark(); ImGui_ImplWin32_Init(overlayWindow); ImGui_ImplDX11_Init(device,context); loadConfig(features); reader.initialize(); weaponHooks.update(features); weaponHooks.initialize(reader.moduleBase());
+    setInputMode();
     bool lastIns=false,lastEnd=false; while(running) { bool ins=(GetAsyncKeyState(VK_INSERT)&1)!=0; bool end=(GetAsyncKeyState(VK_END)&1)!=0; if(ins&&!lastIns){menu=!menu;setInputMode();} if(end&&!lastEnd)running=false; lastIns=ins;lastEnd=end; MSG msg{}; while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){TranslateMessage(&msg);DispatchMessageW(&msg);} render(); Sleep(1); }
     if (menu.exchange(false) && IsWindow(overlayWindow)) setInputMode();
     weaponHooks.shutdown();

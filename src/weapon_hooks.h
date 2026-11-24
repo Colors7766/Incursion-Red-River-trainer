@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 struct Features;
 
@@ -19,7 +20,10 @@ public:
     void requestAddReputation(Faction faction, float points);
     void requestFreeHideoutUpgrade();
     void requestSetTimeOfDay(int hour);
+    void requestSetWeather(int index);
     void refreshWorldTime();
+    std::vector<std::string> weatherOptions() const;
+    std::string weatherStatus() const;
     int currentWorldMinute() const;
     int lastKillCount() const;
     std::string status() const;

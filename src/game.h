@@ -77,6 +77,7 @@ struct Features {
     float playerSpeedMultiplier{1.f};
     float playerJumpHeightMultiplier{1.f};
     float gameSpeedMultiplier{1.f};
+    int weatherIndex{};
     int teleportKey{VK_F6};
     bool captureTeleportKey{false};
     int safeBoxTeleportKey{VK_F7};
